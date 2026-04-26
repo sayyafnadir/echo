@@ -34,6 +34,7 @@ export class AudioPlayer {
   ctx: AudioContext | null = null;
   queue: AudioBufferSourceNode[] = [];
   nextTime = 0;
+  onQueueEmpty: (() => void) | null = null; // add this property
 
   init() {
     if (!this.ctx) {
@@ -66,6 +67,9 @@ export class AudioPlayer {
     
     source.onended = () => {
       this.queue = this.queue.filter(s => s !== source);
+      if (this.queue.length === 0 && this.onQueueEmpty) {
+        this.onQueueEmpty(); // fire when last chunk finishes playing
+      }
     };
   }
 
@@ -77,18 +81,20 @@ export class AudioPlayer {
     });
     this.queue = [];
     this.nextTime = 0;
+    if (this.onQueueEmpty) this.onQueueEmpty(); // fire immediately on manual stop
   }
 }
 
 export class AudioRecorder {
   ctx: AudioContext | null = null;
   stream: MediaStream | null = null;
+  source: MediaStreamAudioSourceNode | null = null;
   processor: ScriptProcessorNode | null = null;
   gain: GainNode | null = null;
   onData: ((base64: string) => void) | null = null;
   
   init() {
-    if (!this.ctx) {
+    if (!this.ctx || this.ctx.state === 'closed') {
       this.ctx = new AudioContext({ sampleRate: 16000 });
     }
   }
@@ -101,11 +107,11 @@ export class AudioRecorder {
     }
 
     this.onData = onData;
+    this.stream?.getTracks().forEach(t => t.stop());
     this.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     
     // Only set up nodes if we haven't already
     if (!this.processor) {
-      const source = this.ctx.createMediaStreamSource(this.stream);
       this.processor = this.ctx.createScriptProcessor(4096, 1, 1);
       
       this.processor.onaudioprocess = (e) => {
@@ -118,20 +124,29 @@ export class AudioRecorder {
       this.gain = this.ctx.createGain();
       this.gain.gain.value = 0;
       
-      source.connect(this.processor);
       this.processor.connect(this.gain);
       this.gain.connect(this.ctx.destination);
     }
+
+    this.source?.disconnect();
+    this.source = this.ctx.createMediaStreamSource(this.stream);
+    this.source.connect(this.processor);
   }
 
   stop() {
     this.onData = null;
+    this.source?.disconnect();
+    this.source = null;
+    this.stream?.getTracks().forEach(t => t.stop());
+    this.stream = null;
+  }
+
+  destroy() {
+    this.stop();
     this.processor?.disconnect();
     this.processor = null;
     this.gain?.disconnect();
     this.gain = null;
-    this.stream?.getTracks().forEach(t => t.stop());
-    this.stream = null;
     this.ctx?.close();
     this.ctx = null;
   }

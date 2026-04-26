@@ -22,18 +22,26 @@ export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [status, setStatus] = useState('IDLE READY');
   const [isConnected, setIsConnected] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
   
   const aiRef = useRef<GoogleGenAI | null>(null);
   const sessionRef = useRef<any>(null);
   const recorderRef = useRef<AudioRecorder | null>(null);
   const playerRef = useRef<AudioPlayer | null>(null);
   const isRecordingRef = useRef(false);
+  const isSpeakingRef = useRef(false);
 
   useEffect(() => {
     aiRef.current = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
     recorderRef.current = new AudioRecorder();
     playerRef.current = new AudioPlayer();
     
+    playerRef.current.onQueueEmpty = () => {
+      isSpeakingRef.current = false;
+      setIsSpeaking(false);
+      setStatus('IDLE READY');
+    };
+
     // Fetch menu on load
     fetch('/api/menu')
       .then(res => res.json())
@@ -44,7 +52,7 @@ export default function App() {
       .catch(err => console.error("Menu Fetch Error:", err));
     
     return () => {
-      recorderRef.current?.stop();
+      recorderRef.current?.destroy();
       playerRef.current?.stop();
       sessionRef.current?.close();
     };
@@ -53,160 +61,162 @@ export default function App() {
   const connectToGemini = async () => {
     if (!aiRef.current) return;
     setStatus('CONNECTING...');
-    
-    const sessionPromise = aiRef.current.live.connect({
-      model: "gemini-3.1-flash-live-preview",
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
+
+    await new Promise<void>(async (resolve) => {
+      const sessionPromise = aiRef.current!.live.connect({
+        model: "gemini-3.1-flash-live-preview",
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
+          },
+          systemInstruction: systemInstruction,
+          tools: [{ functionDeclarations: allTools }],
         },
-        systemInstruction: systemInstruction,
-        tools: [{ functionDeclarations: allTools }],
-      },
-      callbacks: {
-        onopen: () => {
-          setStatus('LISTENING');
-          setIsConnected(true);
-        },
-        onmessage: async (message: LiveServerMessage) => {
-          if (message.serverContent?.turnComplete) {
-            setStatus('IDLE READY');
-          }
-          if (message.serverContent?.modelTurn) {
-            const parts = message.serverContent.modelTurn.parts || [];
-            for (const part of parts) {
-              if (part.inlineData?.data) {
-                playerRef.current?.playPCM(part.inlineData.data, 24000);
-                setStatus('SPEAKING');
+        callbacks: {
+          onopen: () => {
+            setStatus('CONNECTED');
+            setIsConnected(true);
+            resolve(); // Resolve here, not when sessionPromise resolves
+          },
+          onmessage: async (message: LiveServerMessage) => {
+            if (message.serverContent?.turnComplete) {
+              // audio may still be playing — onQueueEmpty fires when playback actually finishes
+            }
+            if (message.serverContent?.modelTurn) {
+              const parts = message.serverContent.modelTurn.parts || [];
+              for (const part of parts) {
+                if (part.inlineData?.data) {
+                  isSpeakingRef.current = true;
+                  setIsSpeaking(true);
+                  playerRef.current?.playPCM(part.inlineData.data, 24000);
+                  setStatus('SPEAKING');
+                }
               }
             }
-          }
-          if (message.serverContent?.interrupted) {
-            playerRef.current?.stop();
-            setStatus('IDLE READY');
-          }
-          if (message.toolCall && sessionRef.current) {
-            const functionResponses = [];
-            for (const call of message.toolCall.functionCalls || []) {
-              if (call.name === 'add_item') {
-                const args = call.args as any;
-                // Find item in the REAL menu to get ID and correct price
-                const item = menu.find(m => m.name.toLowerCase() === args.item_name.toLowerCase());
-                
-                if (item) {
-                  setCart(prev => {
-                    const existing = prev.find(i => i.item_name === item.name);
-                    if (existing) {
-                      return prev.map(i => i.item_name === item.name ? { ...i, quantity: i.quantity + (args.quantity || 1) } : i);
-                    }
-                    return [...prev, { 
-                      item_id: item.id,
-                      item_name: item.name, 
-                      quantity: args.quantity || 1, 
-                      price: item.price 
-                    }];
-                  });
+            if (message.serverContent?.interrupted) {
+              playerRef.current?.stop();
+            }
+            if (message.toolCall && sessionRef.current) {
+              const functionResponses = [];
+              for (const call of message.toolCall.functionCalls || []) {
+                if (call.name === 'add_item') {
+                  const args = call.args as any;
+                  // Find item in the REAL menu to get ID and correct price
+                  const item = menu.find(m => m.name.toLowerCase() === args.item_name.toLowerCase());
+                  
+                  if (item) {
+                    setCart(prev => {
+                      const existing = prev.find(i => i.item_name === item.name);
+                      if (existing) {
+                        return prev.map(i => i.item_name === item.name ? { ...i, quantity: i.quantity + (args.quantity || 1) } : i);
+                      }
+                      return [...prev, { 
+                        item_id: item.id,
+                        item_name: item.name, 
+                        quantity: args.quantity || 1, 
+                        price: item.price 
+                      }];
+                    });
+                    functionResponses.push({
+                      id: call.id,
+                      name: call.name,
+                      response: { result: `Added ${args.quantity || 1} ${item.name} to cart.` }
+                    });
+                  } else {
+                    functionResponses.push({
+                      id: call.id,
+                      name: call.name,
+                      response: { error: `Item '${args.item_name}' not found. Please try again with a valid item name.` }
+                    });
+                  }
+                } else if (call.name === 'remove_item') {
+                  setCart(prev => prev.filter(i => i.item_name !== (call.args as any).item_name));
                   functionResponses.push({
                     id: call.id,
                     name: call.name,
-                    response: { result: `Added ${args.quantity || 1} ${item.name} to cart.` }
+                    response: { result: "Item removed successfully." }
                   });
-                } else {
+                } else if (call.name === 'clear_cart') {
+                  setCart([]);
                   functionResponses.push({
                     id: call.id,
                     name: call.name,
-                    response: { error: `Item '${args.item_name}' not found. Please try again with a valid item name.` }
+                    response: { result: "Cart cleared." }
+                  });
+                } else if (call.name === 'confirm_order') {
+                  submitOrder();
+  
+                  functionResponses.push({
+                    id: call.id,
+                    name: call.name,
+                    response: { result: "Order submitted to the kitchen." }
                   });
                 }
-              } else if (call.name === 'remove_item') {
-                setCart(prev => prev.filter(i => i.item_name !== (call.args as any).item_name));
-                functionResponses.push({
-                  id: call.id,
-                  name: call.name,
-                  response: { result: "Item removed successfully." }
-                });
-              } else if (call.name === 'clear_cart') {
-                setCart([]);
-                functionResponses.push({
-                  id: call.id,
-                  name: call.name,
-                  response: { result: "Cart cleared." }
-                });
-              } else if (call.name === 'confirm_order') {
-                submitOrder();
-
-                functionResponses.push({
-                  id: call.id,
-                  name: call.name,
-                  response: { result: "Order submitted to the kitchen." }
-                });
+              }
+              if (functionResponses.length > 0) {
+                sessionRef.current.sendToolResponse({ functionResponses });
               }
             }
-            if (functionResponses.length > 0) {
-              sessionRef.current.sendToolResponse({ functionResponses });
-            }
+          },
+          onerror: (e) => setStatus('ERROR: ' + e?.message),
+          onclose: () => {
+            setStatus('IDLE READY');
+            setIsConnected(false);
+            sessionRef.current = null;
           }
-        },
-        onerror: (e) => setStatus('ERROR: ' + e?.message),
-        onclose: () => {
-          setStatus('IDLE READY');
-          setIsConnected(false);
-          sessionRef.current = null;
         }
-      }
+      });
+  
+      sessionRef.current = await sessionPromise;
     });
 
-    sessionRef.current = await sessionPromise;
+    // Send an initial empty turn to suppress proactive greetings
+    sessionRef.current?.sendClientContent({
+      turns: [{ role: 'user', parts: [{ text: '' }] }],
+      turnComplete: false
+    });
   };
 
   const handleMouseDown = async () => {
+    if (isSpeakingRef.current) {
+      playerRef.current?.stop();
+      isSpeakingRef.current = false;
+      setIsSpeaking(false);
+    }
+
     isRecordingRef.current = true;
     setIsRecording(true);
     setStatus('LISTENING');
-    
-    playerRef.current?.init();
-    recorderRef.current?.init();
-    playerRef.current?.stop(); 
-    
+
     if (!sessionRef.current) {
       await connectToGemini();
     }
-    
-    if (recorderRef.current && !recorderRef.current.processor) {
-       await recorderRef.current.start((base64) => {
-         if (isRecordingRef.current && sessionRef.current) {
-           sessionRef.current.sendRealtimeInput({
-             audio: { data: base64, mimeType: 'audio/pcm;rate=16000' }
-           });
-         }
-       });
-    }
+
+    await recorderRef.current?.start((base64) => {
+      if (isRecordingRef.current && sessionRef.current) {
+        sessionRef.current.sendRealtimeInput({
+          audio: { data: base64, mimeType: 'audio/pcm;rate=16000' }
+        });
+      }
+    });
   };
 
   const handleMouseUp = () => {
+    if (!isRecordingRef.current) return;
+
     isRecordingRef.current = false;
     setIsRecording(false);
-    setStatus('PROCESSING...');
-    
+
+    recorderRef.current?.stop();
+
     if (sessionRef.current) {
       try {
-        sessionRef.current.sendClientContent({ turnComplete: true });
+        sessionRef.current.sendRealtimeInput({ audioStreamEnd: true });
+        setStatus('PROCESSING...');
       } catch (e) {
-        console.error("turnComplete error", e);
+        console.error('audioStreamEnd error', e);
       }
-      
-      // Sending silence acts as a fallback to trigger VAD
-      try {
-        const bytes = new Uint8Array(16000); // 0.5s silence
-        let binary = '';
-        for (let i = 0; i < bytes.length; i++) {
-          binary += String.fromCharCode(bytes[i]);
-        }
-        sessionRef.current.sendRealtimeInput({
-           audio: { data: window.btoa(binary), mimeType: 'audio/pcm;rate=16000' }
-        });
-      } catch (e) {}
     }
   };
 
@@ -338,7 +348,11 @@ export default function App() {
           <div className="absolute bottom-0 left-0 right-0 p-6 flex flex-col items-center pointer-events-none z-50">
             <div className="w-full h-24 bg-gradient-to-t from-[#F8F7F2] to-transparent absolute bottom-0 left-0 right-0 pointer-events-none"></div>
             <div 
-              className={`ptt-ring relative flex items-center justify-center cursor-pointer transition-all duration-300 pointer-events-auto z-10 shadow-2xl ${isRecording ? 'scale-90 bg-red-600 shadow-red-200' : 'bg-[#5A5A40]'}`}
+              className={`ptt-ring relative flex items-center justify-center cursor-pointer transition-all duration-300 pointer-events-auto z-10 shadow-2xl ${
+                isRecording ? 'scale-90 bg-red-600 shadow-red-200' :
+                isSpeaking  ? 'bg-gray-400 cursor-not-allowed' :
+                'bg-[#5A5A40]'
+              }`}
               onMouseDown={handleMouseDown}
               onMouseUp={handleMouseUp}
               onMouseLeave={handleMouseUp}
@@ -355,7 +369,7 @@ export default function App() {
               </div>
             </div>
             <p className="mt-3 font-bold text-[#5A5A40] tracking-widest uppercase text-[10px] pointer-events-none z-10 drop-shadow-sm">
-              {isRecording ? 'Listening...' : 'Push to Talk'}
+              {isRecording ? 'Listening...' : isSpeaking ? 'Gemini Speaking...' : 'Push to Talk'}
             </p>
           </div>
         </div>
