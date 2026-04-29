@@ -6,23 +6,32 @@
 import { useState, useRef, useEffect } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { AudioPlayer, AudioRecorder } from './lib/audioUtils';
-import { systemInstruction, allTools, MENU_PRICES } from './lib/geminiTools';
+import {
+  allTools,
+  generateSessionId,
+  fetchMenuContext,
+  buildSystemInstruction,
+} from './lib/geminiTools';
 
 type CartItem = {
-  item_id?: number | string;
-  item_name: string;
+  cart_item_id: string;
+  summary: string;
   quantity: number;
-  price: number;
+  unit_price: number;
 };
 
 export default function App() {
   const [cart, setCart] = useState<CartItem[]>([]);
   const [menu, setMenu] = useState<any[]>([]);
-  const [selectedCategory, setSelectedCategory] = useState('Pulao');
+  const [selectedCategory, setSelectedCategory] = useState('Chicken Pulao');
   const [isRecording, setIsRecording] = useState(false);
   const [status, setStatus] = useState('IDLE READY');
   const [isConnected, setIsConnected] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
+
+  // One session ID per page load — stable across multiple PTT presses
+  const sessionIdRef = useRef<string>(generateSessionId());
+  const menuContextRef = useRef<string>('');
   
   const aiRef = useRef<GoogleGenAI | null>(null);
   const sessionRef = useRef<any>(null);
@@ -35,22 +44,37 @@ export default function App() {
     aiRef.current = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
     recorderRef.current = new AudioRecorder();
     playerRef.current = new AudioPlayer();
-    
+
     playerRef.current.onQueueEmpty = () => {
       isSpeakingRef.current = false;
       setIsSpeaking(false);
       setStatus('IDLE READY');
     };
 
-    // Fetch menu on load
+    // Fetch menu context once for both the AI prompt and UI grid
+    fetchMenuContext().then(ctx => {
+      menuContextRef.current = ctx;
+      console.log('Menu context loaded:', ctx.length, 'chars');
+    });
+
+    // Fetch structured menu for the UI category grid
     fetch('/api/menu')
       .then(res => res.json())
       .then(data => {
-        setMenu(data);
-        console.log("Menu Loaded:", data.length, "items");
+        // /api/v1/menu returns category objects; flatten to dish list for UI
+        const dishes: any[] = [];
+        for (const cat of (Array.isArray(data) ? data : [])) {
+          for (const sub of (cat.sub_categories || [])) {
+            for (const dish of (sub.dishes || [])) {
+              dishes.push({ ...dish, category: cat.name });
+            }
+          }
+        }
+        setMenu(dishes);
+        console.log('Menu loaded:', dishes.length, 'dishes');
       })
-      .catch(err => console.error("Menu Fetch Error:", err));
-    
+      .catch(err => console.error('Menu Fetch Error:', err));
+
     return () => {
       recorderRef.current?.destroy();
       playerRef.current?.stop();
@@ -62,6 +86,12 @@ export default function App() {
     if (!aiRef.current) return;
     setStatus('CONNECTING...');
 
+    // Ensure menu context is ready before opening the session
+    if (!menuContextRef.current) {
+      menuContextRef.current = await fetchMenuContext();
+    }
+    const sysInstruction = buildSystemInstruction(menuContextRef.current);
+
     await new Promise<void>(async (resolve) => {
       const sessionPromise = aiRef.current!.live.connect({
         model: "gemini-3.1-flash-live-preview",
@@ -70,19 +100,16 @@ export default function App() {
           speechConfig: {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: "Zephyr" } },
           },
-          systemInstruction: systemInstruction,
+          systemInstruction: sysInstruction,
           tools: [{ functionDeclarations: allTools }],
         },
         callbacks: {
           onopen: () => {
             setStatus('CONNECTED');
             setIsConnected(true);
-            resolve(); // Resolve here, not when sessionPromise resolves
+            resolve();
           },
           onmessage: async (message: LiveServerMessage) => {
-            if (message.serverContent?.turnComplete) {
-              // audio may still be playing — onQueueEmpty fires when playback actually finishes
-            }
             if (message.serverContent?.modelTurn) {
               const parts = message.serverContent.modelTurn.parts || [];
               for (const part of parts) {
@@ -97,84 +124,124 @@ export default function App() {
             if (message.serverContent?.interrupted) {
               playerRef.current?.stop();
             }
+
+            // ── Tool call handling ──────────────────────────────
             if (message.toolCall && sessionRef.current) {
-              const functionResponses = [];
+              const sid = sessionIdRef.current;
+              const functionResponses: any[] = [];
+
               for (const call of message.toolCall.functionCalls || []) {
+                const args = call.args as any;
+
                 if (call.name === 'add_item') {
-                  const args = call.args as any;
-                  // Find item in the REAL menu to get ID and correct price
-                  const item = menu.find(m => m.name.toLowerCase() === args.item_name.toLowerCase());
-                  
-                  if (item) {
-                    setCart(prev => {
-                      const existing = prev.find(i => i.item_name === item.name);
-                      if (existing) {
-                        return prev.map(i => i.item_name === item.name ? { ...i, quantity: i.quantity + (args.quantity || 1) } : i);
-                      }
-                      return [...prev, { 
-                        item_id: item.id,
-                        item_name: item.name, 
-                        quantity: args.quantity || 1, 
-                        price: item.price 
-                      }];
-                    });
+                  // POST to agent adapter — returns ok / requires_input / not_found
+                  const res = await fetch('/api/agent/resolve-item', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      session_id: sid,
+                      dish_query: args.dish_query,
+                      modifiers: args.modifiers || [],
+                      quantity: args.quantity || 1,
+                      notes: args.notes || null,
+                    }),
+                  }).then(r => r.json());
+
+                  if (res.status === 'ok') {
+                    // Add to local UI cart
+                    setCart(prev => [...prev, {
+                      cart_item_id: res.cart_item_id,
+                      summary: res.summary,
+                      quantity: args.quantity || 1,
+                      unit_price: res.unit_price,
+                    }]);
                     functionResponses.push({
-                      id: call.id,
-                      name: call.name,
-                      response: { result: `Added ${args.quantity || 1} ${item.name} to cart.` }
+                      id: call.id, name: call.name,
+                      response: { result: res.summary, cart_item_id: res.cart_item_id },
+                    });
+                  } else {
+                    // requires_input or not_found — give the ai_instruction back to Gemini
+                    functionResponses.push({
+                      id: call.id, name: call.name,
+                      response: { status: res.status, ai_instruction: res.ai_instruction },
+                    });
+                  }
+
+                } else if (call.name === 'remove_item') {
+                  await fetch('/api/agent/remove-item', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sid, cart_item_id: args.cart_item_id }),
+                  });
+                  setCart(prev => prev.filter(i => i.cart_item_id !== args.cart_item_id));
+                  functionResponses.push({
+                    id: call.id, name: call.name,
+                    response: { result: 'Item removed.' },
+                  });
+
+                } else if (call.name === 'clear_cart') {
+                  await fetch('/api/agent/clear-cart', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sid }),
+                  });
+                  setCart([]);
+                  functionResponses.push({
+                    id: call.id, name: call.name,
+                    response: { result: 'Cart cleared.' },
+                  });
+
+                } else if (call.name === 'confirm_order') {
+                  const res = await fetch('/api/agent/submit-order', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      session_id: sid,
+                      customer_name: args.customer_name || 'Guest',
+                      customer_phone: args.customer_phone || '0000000000',
+                      order_type: args.order_type || 'dine_in',
+                      notes: args.notes || null,
+                    }),
+                  }).then(r => r.json());
+
+                  if (res.order_id) {
+                    setCart([]);
+                    setStatus('ORDER CONFIRMED');
+                    setTimeout(() => setStatus('IDLE READY'), 4000);
+                    functionResponses.push({
+                      id: call.id, name: call.name,
+                      response: { result: res.summary },
                     });
                   } else {
                     functionResponses.push({
-                      id: call.id,
-                      name: call.name,
-                      response: { error: `Item '${args.item_name}' not found. Please try again with a valid item name.` }
+                      id: call.id, name: call.name,
+                      response: { error: 'Order submission failed. Please try again.' },
                     });
                   }
-                } else if (call.name === 'remove_item') {
-                  setCart(prev => prev.filter(i => i.item_name !== (call.args as any).item_name));
-                  functionResponses.push({
-                    id: call.id,
-                    name: call.name,
-                    response: { result: "Item removed successfully." }
-                  });
-                } else if (call.name === 'clear_cart') {
-                  setCart([]);
-                  functionResponses.push({
-                    id: call.id,
-                    name: call.name,
-                    response: { result: "Cart cleared." }
-                  });
-                } else if (call.name === 'confirm_order') {
-                  submitOrder();
-  
-                  functionResponses.push({
-                    id: call.id,
-                    name: call.name,
-                    response: { result: "Order submitted to the kitchen." }
-                  });
                 }
               }
+
               if (functionResponses.length > 0) {
                 sessionRef.current.sendToolResponse({ functionResponses });
               }
             }
           },
-          onerror: (e) => setStatus('ERROR: ' + e?.message),
+          onerror: (e: any) => setStatus('ERROR: ' + e?.message),
           onclose: () => {
             setStatus('IDLE READY');
             setIsConnected(false);
             sessionRef.current = null;
-          }
-        }
+          },
+        },
       });
-  
+
       sessionRef.current = await sessionPromise;
     });
 
-    // Send an initial empty turn to suppress proactive greetings
+    // Suppress proactive greeting
     sessionRef.current?.sendClientContent({
       turns: [{ role: 'user', parts: [{ text: '' }] }],
-      turnComplete: false
+      turnComplete: false,
     });
   };
 
@@ -220,42 +287,33 @@ export default function App() {
     }
   };
 
-  const submitOrder = () => {
+  const submitOrder = async () => {
     if (cart.length === 0) return;
     setStatus('SUBMITTING...');
-    
-    const formattedItems = cart.map(item => ({
-      menu_item_id: item.item_id,
-      quantity: item.quantity
-    }));
+    try {
+      const res = await fetch('/api/agent/submit-order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sessionIdRef.current,
+          customer_name: 'Guest',
+          customer_phone: '0000000000',
+          order_type: 'dine_in',
+        }),
+      }).then(r => r.json());
 
-    fetch('/api/orders', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        customer_name: "Voice Kiosk User",
-        items: formattedItems
-      })
-    })
-    .then(res => res.json())
-    .then(data => {
-      console.log("Order Sync:", data.success ? `Order ID: ${data.orderId}` : "Sync Failed: " + data.error);
-      if (data.success) {
+      if (res.order_id) {
         setCart([]);
         setStatus('ORDER CONFIRMED');
-        setTimeout(() => setStatus('IDLE READY'), 3000);
+        setTimeout(() => setStatus('IDLE READY'), 4000);
       } else {
-        setStatus('SYNC ERROR');
+        setStatus('SUBMIT ERROR');
       }
-    })
-    .catch(err => {
-      console.error("Database Error:", err);
-      setStatus('SYNC ERROR');
-    });
-
-    if (sessionRef.current) {
-      sessionRef.current.close();
+    } catch (err) {
+      console.error('submitOrder error:', err);
+      setStatus('SUBMIT ERROR');
     }
+    sessionRef.current?.close();
   };
 
   const clearCart = () => {
@@ -266,7 +324,7 @@ export default function App() {
     }
   };
 
-  const subtotal = cart.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+  const subtotal = cart.reduce((sum, item) => sum + (item.unit_price * item.quantity), 0);
   const gst = Math.round(subtotal * 0.15);
   const total = subtotal + gst;
 
@@ -279,15 +337,15 @@ export default function App() {
         </div>
 
         <nav className="flex flex-col gap-2 overflow-y-auto max-h-[60vh]">
-          {['Pulao', 'Burgers', 'Fried', 'Deals', 'Desserts', 'Beverages', 'Breakfast', 'Sides', 'Seasonal'].map(cat => (
-            <div 
-              key={cat}
-              onClick={() => setSelectedCategory(cat)}
+          {[...new Set(menu.map((m: any) => m.category))].map(cat => (
+            <div
+              key={cat as string}
+              onClick={() => setSelectedCategory(cat as string)}
               className={`sidebar-item p-4 rounded-r-lg cursor-pointer transition-all ${selectedCategory === cat ? 'active' : 'opacity-70 hover:opacity-100 hover:bg-white/10'}`}
             >
-              <p className="font-semibold">{cat}</p>
+              <p className="font-semibold">{cat as string}</p>
               <p className="text-[10px] opacity-50 uppercase">
-                {menu.filter(m => m.category === cat).length} Items
+                {menu.filter((m: any) => m.category === cat).length} Items
               </p>
             </div>
           ))}
@@ -319,24 +377,11 @@ export default function App() {
                   <div key={item.id} className="p-4 bg-white/40 rounded-xl border border-white/40 hover:border-[#A39171]/40 transition-all group">
                     <div className="flex justify-between items-start mb-1">
                       <h4 className="font-bold text-[#5A5A40]">{item.name}</h4>
-                      <span className="font-mono text-sm">PKR {item.price}</span>
+                      <span className="font-mono text-sm">PKR {item.display_price || item.price || item.base_price}</span>
                     </div>
                     <p className="text-xs opacity-60 line-clamp-2 mb-3">{item.description}</p>
                     <div className="flex justify-between items-center">
-                      <span className="text-[10px] uppercase tracking-widest px-2 py-0.5 bg-white/60 rounded">{item.size}</span>
-                      <button 
-                         onClick={() => {
-                           setCart(prev => {
-                             const existing = prev.find(i => (i as any).item_id === item.id);
-                             if (existing) {
-                               return prev.map(i => (i as any).item_id === item.id ? { ...i, quantity: i.quantity + 1 } : i);
-                             }
-                             return [...prev, { item_id: item.id, item_name: item.name, quantity: 1, price: item.price }];
-                           });
-                         }}
-                         className="text-[10px] font-bold uppercase tracking-widest bg-[#5A5A40] text-white px-3 py-1.5 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity">
-                        Add to Cart
-                      </button>
+                      <span className="text-[10px] uppercase tracking-widest px-2 py-0.5 bg-white/60 rounded">{item.tag || ''}</span>
                     </div>
                   </div>
                 ))
@@ -388,12 +433,10 @@ export default function App() {
             ) : (
               cart.map((item, idx) => (
                 <div key={idx} className="flex justify-between items-start">
-                  <div>
-                    <p className="font-bold text-sm">
-                      {item.quantity}x {item.item_name}
-                    </p>
+                  <div className="flex-1 pr-2">
+                    <p className="font-bold text-sm">{item.summary}</p>
                   </div>
-                  <span className="font-mono text-sm">PKR {item.price * item.quantity}</span>
+                  <span className="font-mono text-sm whitespace-nowrap">PKR {Math.round(item.unit_price * item.quantity)}</span>
                 </div>
               ))
             )}

@@ -32,51 +32,61 @@ async function startServer() {
 
   const supabase = getSupabase();
 
-  // External API Config
-  const EXTERNAL_API_URL = 'https://voiceai-hzyb.onrender.com';
+  // External API Config — AI adapter backend
+  const BACKEND_URL = process.env.BACKEND_URL || 'https://voiceai-hzyb.onrender.com';
 
-  // API Route: Get Menu from external API
-  app.get('/api/menu', async (req, res) => {
+  // ── Generic agent proxy helper ──────────────────────────────
+  const proxyGet = async (path: string, req: any, res: any) => {
     try {
-      const response = await axios.get(`${EXTERNAL_API_URL}/menu`);
-      res.json(response.data);
-    } catch (err: any) {
-      console.error('External Menu API Error:', err.message);
-      res.status(500).json({ error: 'Failed to fetch menu from external source' });
-    }
-  });
-
-  // API Route: Create Order in external API
-  app.post('/api/orders', async (req, res) => {
-    const { customer_name, items } = req.body;
-    console.log('📦 Incoming Order request:', JSON.stringify(req.body));
-    
-    try {
-      // items looks like: [{ menu_item_id: 1, quantity: 2 }, ...]
-      const response = await axios.post(`${EXTERNAL_API_URL}/orders`, {
-        customer_name: customer_name || 'Voice Kiosk User',
-        items: items
-      });
-      
-      // Also optionally log to local Supabase if configured (as a backup)
-      if (supabase) {
-        const { error: syncError } = await supabase.from('orders').insert([{ 
-          items, 
-          external_order_id: response.data.id,
-          status: 'synced_to_render' 
-        }]);
-        if (syncError) console.warn('Supabase local sync failed:', syncError.message);
+      const url = new URL(BACKEND_URL + path);
+      // Forward any query params
+      Object.entries(req.query as Record<string, string>).forEach(([k, v]) => url.searchParams.set(k, v));
+      const response = await axios.get(url.toString());
+      // If backend returns plain text (menu-context) don't force JSON
+      const ct = String(response.headers['content-type'] || '');
+      if (ct.includes('text/plain') || typeof response.data === 'string') {
+        res.type('text/plain').send(response.data);
+      } else {
+        res.json(response.data);
       }
-
-      res.status(201).json({ success: true, orderId: response.data.id });
     } catch (err: any) {
-      console.error('External Order API Error:', err.response?.data || err.message);
-      res.status(500).json({ 
-        success: false, 
-        error: err.response?.data?.detail || err.message 
-      });
+      console.error(`GET ${path} error:`, err.response?.data || err.message);
+      res.status(err.response?.status || 500).json(err.response?.data || { error: err.message });
     }
-  });
+  };
+
+  const proxyPost = async (path: string, req: any, res: any, successStatus = 200) => {
+    try {
+      const response = await axios.post(BACKEND_URL + path, req.body);
+      res.status(successStatus).json(response.data);
+    } catch (err: any) {
+      console.error(`POST ${path} error:`, err.response?.data || err.message);
+      res.status(err.response?.status || 500).json(err.response?.data || { error: err.message });
+    }
+  };
+
+  // ── Agent routes (used by Gemini tool call handlers) ─────────
+
+  // Full menu as Markdown — called once at session start and injected into system prompt
+  app.get('/api/agent/menu-context', (req, res) => proxyGet('/api/v1/agent/menu-context', req, res));
+
+  // Resolve a dish + modifiers → validate required options → add to server-side cart
+  app.post('/api/agent/resolve-item', (req, res) => proxyPost('/api/v1/agent/resolve-item', req, res));
+
+  // Remove a cart item by cart_item_id
+  app.post('/api/agent/remove-item', (req, res) => proxyPost('/api/v1/agent/remove-item', req, res));
+
+  // Clear entire session cart
+  app.post('/api/agent/clear-cart', (req, res) => proxyPost('/api/v1/agent/clear-cart', req, res));
+
+  // View current cart (used by the UI to display cart state)
+  app.get('/api/agent/cart/:sessionId', (req, res) => proxyGet(`/api/v1/agent/cart/${req.params.sessionId}`, req, res));
+
+  // Submit finalised order to the database
+  app.post('/api/agent/submit-order', (req, res) => proxyPost('/api/v1/agent/submit-order', req, res, 201));
+
+  // ── Legacy menu read (kept for the menu display grid in the UI) ─
+  app.get('/api/menu', (req, res) => proxyGet('/api/v1/menu', req, res));
 
   // Health check endpoint
   app.get('/api/health', (req, res) => {
