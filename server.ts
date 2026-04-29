@@ -39,28 +39,48 @@ async function startServer() {
   const proxyGet = async (path: string, req: any, res: any) => {
     try {
       const url = new URL(BACKEND_URL + path);
-      // Forward any query params
       Object.entries(req.query as Record<string, string>).forEach(([k, v]) => url.searchParams.set(k, v));
+      console.log(`\n[AGENT] → GET  ${url.toString()}`);
       const response = await axios.get(url.toString());
-      // If backend returns plain text (menu-context) don't force JSON
       const ct = String(response.headers['content-type'] || '');
+      console.log(`[AGENT] ← ${response.status} ${url.pathname}`);
       if (ct.includes('text/plain') || typeof response.data === 'string') {
         res.type('text/plain').send(response.data);
       } else {
         res.json(response.data);
       }
     } catch (err: any) {
-      console.error(`GET ${path} error:`, err.response?.data || err.message);
+      console.error(`[AGENT] ✗ GET ${path} error:`, err.response?.data || err.message);
       res.status(err.response?.status || 500).json(err.response?.data || { error: err.message });
     }
   };
 
   const proxyPost = async (path: string, req: any, res: any, successStatus = 200) => {
+    const fullUrl = BACKEND_URL + path;
+    console.log(`\n[AGENT] → POST ${fullUrl}`);
+    console.log(`[AGENT]   payload:`, JSON.stringify(req.body, null, 2));
     try {
-      const response = await axios.post(BACKEND_URL + path, req.body);
+      const response = await axios.post(fullUrl, req.body);
+      console.log(`[AGENT] ← ${response.status} ${path}`);
+      console.log(`[AGENT]   response:`, JSON.stringify(response.data, null, 2));
       res.status(successStatus).json(response.data);
     } catch (err: any) {
-      console.error(`POST ${path} error:`, err.response?.data || err.message);
+      console.error(`[AGENT] ✗ POST ${path} error:`, err.response?.data || err.message);
+      res.status(err.response?.status || 500).json(err.response?.data || { error: err.message });
+    }
+  };
+
+  const proxyPatch = async (path: string, req: any, res: any) => {
+    const fullUrl = BACKEND_URL + path;
+    console.log(`\n[ORDERS] → PATCH ${fullUrl}`);
+    console.log(`[ORDERS]   payload:`, JSON.stringify(req.body, null, 2));
+    try {
+      const response = await axios.patch(fullUrl, req.body);
+      console.log(`[ORDERS] ← ${response.status} ${path}`);
+      console.log(`[ORDERS]   response:`, JSON.stringify(response.data, null, 2));
+      res.json(response.data);
+    } catch (err: any) {
+      console.error(`[ORDERS] ✗ PATCH ${path} error:`, err.response?.data || err.message);
       res.status(err.response?.status || 500).json(err.response?.data || { error: err.message });
     }
   };
@@ -87,6 +107,10 @@ async function startServer() {
 
   // ── Legacy menu read (kept for the menu display grid in the UI) ─
   app.get('/api/menu', (req, res) => proxyGet('/api/v1/menu', req, res));
+
+  // ── Orders dashboard routes ───────────────────────────────────
+  app.get('/api/orders', (req, res) => proxyGet('/api/v1/orders', req, res));
+  app.patch('/api/orders/:orderId/status', (req, res) => proxyPatch(`/api/v1/orders/${req.params.orderId}/status`, req, res));
 
   // Health check endpoint
   app.get('/api/health', (req, res) => {

@@ -20,7 +20,7 @@ type CartItem = {
   unit_price: number;
 };
 
-export default function App() {
+export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?: () => void }) {
   const [cart, setCart] = useState<CartItem[]>([]);
   const [menu, setMenu] = useState<any[]>([]);
   const [selectedCategory, setSelectedCategory] = useState('Chicken Pulao');
@@ -350,6 +350,15 @@ export default function App() {
             </div>
           ))}
         </nav>
+
+        {onNavigateToDashboard && (
+          <button
+            onClick={onNavigateToDashboard}
+            className="w-full py-3 glass-panel rounded-2xl text-xs font-bold uppercase tracking-widest text-[#5A5A40] hover:bg-white/80 transition-colors cursor-pointer"
+          >
+            Live Orders →
+          </button>
+        )}
 
         <div className="mt-auto glass-panel p-4">
           <p className="text-[10px] uppercase tracking-tighter opacity-50 mb-2">System Status</p>
