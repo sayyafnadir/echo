@@ -35,13 +35,21 @@ async function startServer() {
   // External API Config — AI adapter backend
   const BACKEND_URL = process.env.BACKEND_URL || 'https://voiceai-hzyb.onrender.com';
 
+  // Axios instance with timeout so cold Render starts fail fast instead of hanging
+  const backendClient = axios.create({ timeout: 15000 });
+
+  // Ping on server start to wake Render from sleep before the first user request
+  backendClient.get(`${BACKEND_URL}/api/v1/menu`).catch(() =>
+    console.warn('[WARMUP] Render backend is cold-starting — first requests may be slow')
+  );
+
   // ── Generic agent proxy helper ──────────────────────────────
   const proxyGet = async (path: string, req: any, res: any) => {
     try {
       const url = new URL(BACKEND_URL + path);
       Object.entries(req.query as Record<string, string>).forEach(([k, v]) => url.searchParams.set(k, v));
       console.log(`\n[AGENT] → GET  ${url.toString()}`);
-      const response = await axios.get(url.toString());
+      const response = await backendClient.get(url.toString());
       const ct = String(response.headers['content-type'] || '');
       console.log(`[AGENT] ← ${response.status} ${url.pathname}`);
       if (ct.includes('text/plain') || typeof response.data === 'string') {
@@ -60,7 +68,7 @@ async function startServer() {
     console.log(`\n[AGENT] → POST ${fullUrl}`);
     console.log(`[AGENT]   payload:`, JSON.stringify(req.body, null, 2));
     try {
-      const response = await axios.post(fullUrl, req.body);
+      const response = await backendClient.post(fullUrl, req.body);
       console.log(`[AGENT] ← ${response.status} ${path}`);
       console.log(`[AGENT]   response:`, JSON.stringify(response.data, null, 2));
       res.status(successStatus).json(response.data);
@@ -69,13 +77,13 @@ async function startServer() {
       res.status(err.response?.status || 500).json(err.response?.data || { error: err.message });
     }
   };
-
+  
   const proxyPatch = async (path: string, req: any, res: any) => {
     const fullUrl = BACKEND_URL + path;
     console.log(`\n[ORDERS] → PATCH ${fullUrl}`);
     console.log(`[ORDERS]   payload:`, JSON.stringify(req.body, null, 2));
     try {
-      const response = await axios.patch(fullUrl, req.body);
+      const response = await backendClient.patch(fullUrl, req.body);
       console.log(`[ORDERS] ← ${response.status} ${path}`);
       console.log(`[ORDERS]   response:`, JSON.stringify(response.data, null, 2));
       res.json(response.data);

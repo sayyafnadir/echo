@@ -146,15 +146,31 @@ export const allTools = [add_item, remove_item, clear_cart, confirm_order];
 // ─────────────────────────────────────────────────────────────
 // Helper: fetch menu context (call once at session start)
 // ─────────────────────────────────────────────────────────────
+const MENU_CACHE_KEY = 'savour_menu_context_v1';
+
 export async function fetchMenuContext(): Promise<string> {
-  try {
-    const res = await fetch("/api/agent/menu-context");
-    if (!res.ok) throw new Error(`menu-context fetch failed: ${res.status}`);
-    return await res.text();
-  } catch (err) {
-    console.error("fetchMenuContext error:", err);
-    return ""; // Fallback: agent will work without menu context (less reliable)
+  const MAX_ATTEMPTS = 4;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch("/api/agent/menu-context");
+      if (!res.ok) throw new Error(`status ${res.status}`);
+      const text = await res.text();
+      // Backend returning an error JSON (e.g. {"detail":"[Errno 11]..."}) instead of menu markdown
+      if (text.trimStart().startsWith('{')) throw new Error('backend returned error JSON');
+      localStorage.setItem(MENU_CACHE_KEY, text);
+      return text;
+    } catch (err) {
+      console.warn(`fetchMenuContext attempt ${attempt}/${MAX_ATTEMPTS} failed:`, err);
+      if (attempt < MAX_ATTEMPTS) await new Promise(r => setTimeout(r, attempt * 1500));
+    }
   }
+  const cached = localStorage.getItem(MENU_CACHE_KEY);
+  if (cached) {
+    console.warn('fetchMenuContext: all attempts failed, using cached menu context');
+    return cached;
+  }
+  console.error("fetchMenuContext: all attempts exhausted, no cache");
+  return "";
 }
 
 

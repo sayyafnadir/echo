@@ -39,6 +39,7 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
   const playerRef = useRef<AudioPlayer | null>(null);
   const isRecordingRef = useRef(false);
   const isSpeakingRef = useRef(false);
+  const buttonHeldRef = useRef(false);
 
   useEffect(() => {
     aiRef.current = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
@@ -92,8 +93,18 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
     }
     const sysInstruction = buildSystemInstruction(menuContextRef.current);
 
-    await new Promise<void>(async (resolve) => {
-      const sessionPromise = aiRef.current!.live.connect({
+    await new Promise<void>((resolve, reject) => {
+      let pendingSession: any = null;
+      let wsOpen = false;
+
+      const tryResolve = () => {
+        if (pendingSession && wsOpen) {
+          sessionRef.current = pendingSession;
+          resolve();
+        }
+      };
+
+      aiRef.current!.live.connect({
         model: "gemini-3.1-flash-live-preview",
         config: {
           responseModalities: [Modality.AUDIO],
@@ -107,7 +118,8 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
           onopen: () => {
             setStatus('CONNECTED');
             setIsConnected(true);
-            resolve();
+            wsOpen = true;
+            tryResolve();
           },
           onmessage: async (message: LiveServerMessage) => {
             if (message.serverContent?.modelTurn) {
@@ -226,23 +238,22 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
               }
             }
           },
-          onerror: (e: any) => setStatus('ERROR: ' + e?.message),
+          onerror: (e: any) => {
+            setStatus('ERROR: ' + e?.message);
+            reject(e);
+          },
           onclose: () => {
             setStatus('IDLE READY');
             setIsConnected(false);
             sessionRef.current = null;
           },
         },
-      });
-
-      sessionRef.current = await sessionPromise;
+      }).then(session => {
+        pendingSession = session;
+        tryResolve();
+      }).catch(reject);
     });
 
-    // Suppress proactive greeting
-    sessionRef.current?.sendClientContent({
-      turns: [{ role: 'user', parts: [{ text: '' }] }],
-      turnComplete: false,
-    });
   };
 
   const handleMouseDown = async () => {
@@ -252,13 +263,37 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
       setIsSpeaking(false);
     }
 
+    buttonHeldRef.current = true;
+
+    if (!sessionRef.current) {
+      const MAX_ATTEMPTS = 3;
+      for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+          if (attempt > 1) {
+            setStatus(`RETRYING (${attempt}/${MAX_ATTEMPTS})...`);
+            await new Promise(r => setTimeout(r, attempt * 1500));
+          }
+          await connectToGemini();
+          break;
+        } catch {
+          if (attempt === MAX_ATTEMPTS) {
+            setStatus('CONNECTION FAILED — TAP TO RETRY');
+            buttonHeldRef.current = false;
+            return;
+          }
+        }
+      }
+    }
+
+    // Button released during connection — don't start recording
+    if (!buttonHeldRef.current) {
+      setStatus('IDLE READY');
+      return;
+    }
+
     isRecordingRef.current = true;
     setIsRecording(true);
     setStatus('LISTENING');
-
-    if (!sessionRef.current) {
-      await connectToGemini();
-    }
 
     await recorderRef.current?.start((base64) => {
       if (isRecordingRef.current && sessionRef.current) {
@@ -270,6 +305,8 @@ export default function App({ onNavigateToDashboard }: { onNavigateToDashboard?:
   };
 
   const handleMouseUp = () => {
+    buttonHeldRef.current = false;
+
     if (!isRecordingRef.current) return;
 
     isRecordingRef.current = false;
